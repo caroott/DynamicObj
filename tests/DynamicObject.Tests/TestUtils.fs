@@ -17,6 +17,14 @@ type DerivedClass(stat: string, dyn: string) as this =
     member this.stat = stat
 
 [<AttachMembers>]
+type DerivedClassWithMutableInstanceProperty(?location: string) =
+    inherit DynamicObj()
+    let mutable _location = location
+    member this.Location
+        with get() = _location
+        and set(value) = _location <- value
+
+[<AttachMembers>]
 type DerivedClassCloneable(stat: string, dyn: string) as this =
     inherit DynamicObj()
     do

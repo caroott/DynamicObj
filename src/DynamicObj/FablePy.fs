@@ -7,6 +7,10 @@ open Fable.Core
 open System.Collections.Generic
 
 module FablePy =
+
+    [<Emit("int($0)")>]
+    let toPythonInt (value:int) : int =
+        nativeOnly
     
     module Dictionary = 
         
@@ -70,25 +74,54 @@ module FablePy =
             else
                 None
 
+    // Declared F# properties transpile to Python descriptors backed by fields.
+    // Use getattr so reads go through the descriptor instead of Properties.
     [<Emit("getattr($0,$1)")>]
+    let getStaticPropertyValue (o:obj) (propName:string) =
+        nativeOnly
+
+    // PropertyHelper stores delegates, so wrap descriptor access in a getter.
+    let createStaticGetter (propName:string) =
+        fun (o:obj) ->
+            getStaticPropertyValue o propName
+
+    // Use setattr so Python property setters update their backing fields.
+    [<Emit("setattr($0,$1,$2)")>]
+    let setStaticPropertyValue (o:obj) (propName:string) (value:obj) : unit =
+        nativeOnly
+
+    // PropertyHelper stores delegates, so wrap descriptor access in a setter.
+    let createStaticSetter (propName:string) =
+        fun (o:obj) (value:obj) ->
+         setStaticPropertyValue o propName value
+
+    // Dynamic properties must use DynamicObj.Properties.
+    // Fable-generated backing fields also live in Python instance attributes.
+    [<Emit("$0.Properties[$1]")>]
     let getPropertyValue (o:obj) (propName:string) =
         nativeOnly
 
     let createGetter (propName:string) =
-        fun (o:obj) -> 
+        fun (o:obj) ->
             getPropertyValue o propName
 
-    [<Emit("setattr($0,$1,$2)")>]
-    let setPropertyValue (o:obj) (propName:string) (value:obj) : unit =    
+    // Keep SetProperty aligned with .NET by writing dynamic values to Properties.
+    [<Emit("$0.Properties[$1] = $2")>]
+    let setPropertyValue (o:obj) (propName:string) (value:obj) : unit =
         nativeOnly
 
     let createSetter (propName:string) =
-        fun (o:obj) (value:obj) -> 
+        fun (o:obj) (value:obj) ->
          setPropertyValue o propName value
 
 
-    [<Emit("vars($0).items()")>]
+    [<Emit("vars($0)")>]
     let getOwnMemberObjects (o:obj) : Dictionary<string,obj> =
+        nativeOnly
+
+    // Enumerate only explicit dynamic properties, not generated instance fields.
+    [<Emit("$0.Properties")>]
+    let getDynamicMemberObjects (o:obj) : Dictionary<string,obj> =
         nativeOnly
 
     [<Emit("$0.__class__")>]
@@ -98,12 +131,17 @@ module FablePy =
     let getStaticPropertyObjects (o:obj) : Dictionary<string,PropertyObject> =
         getClass o
         |> getOwnMemberObjects
-        |> Dictionary.choose PropertyObject.tryProperty
+        |> Seq.choose (fun kv ->
+            kv.Value
+            |> PropertyObject.tryProperty
+            |> Option.map (fun po -> KeyValuePair(kv.Key, po))
+        )
+        |> Dictionary.ofSeq
 
     let removeStaticPropertyValue (o:obj) (propName:string) =
-        setPropertyValue o propName null
+        setStaticPropertyValue o propName null
 
-    [<Emit("delattr($0,$1)")>]
+    [<Emit("$0.Properties.pop($1, None)")>]
     let deleteDynamicPropertyValue (o:obj) (propName:string) =
         nativeOnly
 
@@ -117,18 +155,35 @@ module FablePy =
 
 
 
-    [<Emit("$0.__dict__.get($1)")>]
+    [<Emit("$1 in $0.__dict__")>]
+    let hasOwnMemberObject (o:obj) (propName:string) : bool =
+        nativeOnly
+
+    [<Emit("$0.__dict__[$1]")>]
+    let getOwnMemberObject (o:obj) (propName:string) =
+        nativeOnly
+
+    // Dynamic lookup checks Properties so backing fields never count as members.
+    [<Emit("$1 in $0.Properties")>]
+    let hasMemberObject (o:obj) (propName:string) : bool =
+        nativeOnly
+
+    [<Emit("$0.Properties[$1]")>]
     let getMemberObject (o:obj) (propName:string) =
         nativeOnly
 
     let tryGetPropertyObject (o:obj) (propName:string) : PropertyObject option =
-        match PropertyObject.tryProperty (getMemberObject o propName) with
+        let memberObject =
+            if hasOwnMemberObject o propName then
+                getOwnMemberObject o propName
+            else
+                null
+        match PropertyObject.tryProperty memberObject with
         | Some po -> Some po
         | None -> None
 
     let tryGetDynamicPropertyHelper (o:obj) (propName:string) : PropertyHelper option =
-        match getMemberObject o propName with
-        | Some _ -> 
+        if hasMemberObject o propName then
             Some {
                 Name = propName
                 IsStatic = false
@@ -139,7 +194,8 @@ module FablePy =
                 SetValue = createSetter propName
                 RemoveValue = fun o -> deleteDynamicPropertyValue o propName
             }
-        | None -> None
+        else
+            None
 
     let tryGetStaticPropertyHelper (o:obj) (propName:string) : PropertyHelper option =
         match tryGetPropertyObject (getClass o) propName with
@@ -151,36 +207,27 @@ module FablePy =
                 IsDynamic = false
                 IsMutable = isWritable
                 IsImmutable = not isWritable
-                GetValue = createGetter propName
-                SetValue = createSetter propName
+                GetValue = createStaticGetter propName
+                SetValue = createStaticSetter propName
                 RemoveValue = fun o -> removeStaticPropertyValue o propName
             }
          | None -> None
 
-    let transpiledPropertyRegex = "^([a-zA-Z]+_)+[0-9]+$"
-
-    let isTranspiledPropertyHelper (propertyName : string) =
-        System.Text.RegularExpressions.Regex.IsMatch(propertyName, transpiledPropertyRegex)
-
-
     let getDynamicPropertyHelpers (o:obj) : PropertyHelper [] =
-        getOwnMemberObjects o
+        getDynamicMemberObjects o
         |> Seq.choose (fun kv -> 
             let n = kv.Key
-            if isTranspiledPropertyHelper n then 
-                None
-            else
-                {
-                    Name = n
-                    IsStatic = false
-                    IsDynamic = true
-                    IsMutable = true
-                    IsImmutable = false
-                    GetValue = createGetter n
-                    SetValue = createSetter n
-                    RemoveValue = fun o -> deleteDynamicPropertyValue o n
-                }
-                |> Some
+            {
+                Name = n
+                IsStatic = false
+                IsDynamic = true
+                IsMutable = true
+                IsImmutable = false
+                GetValue = createGetter n
+                SetValue = createSetter n
+                RemoveValue = fun o -> deleteDynamicPropertyValue o n
+            }
+            |> Some
         )
         |> Seq.toArray
 
@@ -196,8 +243,8 @@ module FablePy =
                 IsDynamic = false
                 IsMutable = PropertyObject.isWritable po
                 IsImmutable = not (PropertyObject.isWritable po)
-                GetValue = createGetter n
-                SetValue = createSetter n
+                GetValue = createStaticGetter n
+                SetValue = createStaticSetter n
                 RemoveValue = fun o -> removeStaticPropertyValue o n
             }
         )
@@ -224,6 +271,11 @@ module FablePy =
     module Dictionaries =
         [<Emit("""isinstance($0, dict)""")>]
         let isDict (o:obj) : bool =
+            nativeOnly
+
+    module Collections =
+        [<Emit("""isinstance($0, list)""")>]
+        let isList (o:obj) : bool =
             nativeOnly
 
 #endif

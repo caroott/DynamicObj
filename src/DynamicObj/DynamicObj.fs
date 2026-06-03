@@ -393,6 +393,20 @@ type DynamicObj() =
     member this.StructurallyEquals (other: DynamicObj) =
         this.GetHashCode() = other.GetHashCode()
 
+    #if FABLE_COMPILER_PYTHON
+    // Python hash() uses __hash__ before Fable's GetHashCode; keep structural hashing.
+    // __hash__ must return a native Python int, not a Fable int32 wrapper.
+    member this.``__hash__``() =
+        HashUtils.deepHash this
+        |> FablePy.toPythonInt
+
+    // Make native Python equality (a == b) match the .NET/F# Equals implementation.
+    member this.``__eq__``(o: obj) =
+        match o with
+        | :? DynamicObj as other -> this.StructurallyEquals(other)
+        | _ -> false
+    #endif
+
     override this.GetHashCode () =
         HashUtils.deepHash this
 
@@ -992,6 +1006,9 @@ and CopyUtils =
                 let newDict = Dictionary<obj,obj>()
                 for kv in o do newDict.Add(tryDeepCopyObj kv.Key, tryDeepCopyObj kv.Value)
                 newDict |> box
+            | o when FablePy.Collections.isList o ->
+                let o = o |> unbox<ResizeArray<obj>>
+                ResizeArray([for item in o -> tryDeepCopyObj item]) |> box
             #endif
 
             // These collections of DynamicObj can be cloned recursively
