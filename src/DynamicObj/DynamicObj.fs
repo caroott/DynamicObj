@@ -30,6 +30,13 @@ type DynamicObj() =
     static member ofDict (dynamicProperties: Dictionary<string,obj>) = 
         let obj = DynamicObj()
         obj.Properties <- dynamicProperties
+        // ofDict bypasses SetProperty, so Fable targets must rebuild native mirrors explicitly.
+        #if FABLE_COMPILER_JAVASCRIPT || FABLE_COMPILER_TYPESCRIPT
+        FableJS.syncRuntimeDynamicProperties obj
+        #endif
+        #if FABLE_COMPILER_PYTHON
+        FablePy.syncRuntimeDynamicProperties obj
+        #endif
         obj
 
     /// <summary>

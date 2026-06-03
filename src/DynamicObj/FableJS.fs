@@ -54,20 +54,128 @@ module FableJS =
         |> getOwnPropertyNames
         |> Array.filter (fun n -> n <> "constructor")
 
-    [<Emit("$0[$1] = $2")>]
-    let setPropertyValue (o:obj) (propName:string) (value:obj) =    
+    [<Emit("$0.Properties")>]
+    let getDynamicPropertyObjects (o: obj) : System.Collections.Generic.Dictionary<string,obj> =
         jsNative
+
+    [<Emit("$0.Properties.has($1)")>]
+    let hasStoredPropertyValue (o: obj) (propName: string) : bool =
+        jsNative
+
+    [<Emit("$0.Properties.get($1)")>]
+    let getStoredPropertyValue (o: obj) (propName: string) : obj =
+        jsNative
+
+    [<Emit("$0.Properties.set($1, $2)")>]
+    let setStoredPropertyValue (o: obj) (propName: string) (value: obj) : unit =
+        jsNative
+
+    // Track DynamicObj-owned runtime mirrors outside the object so user keys cannot collide.
+    // WeakMap entries are collected with their objects and do not reserve any property name.
+    [<Emit("""globalThis[Symbol.for("DynamicObj.mirrorSets")] || (globalThis[Symbol.for("DynamicObj.mirrorSets")] = new WeakMap())""")>]
+    let getMirrorSets () : obj =
+        jsNative
+
+    // Check whether this object already has mirror ownership metadata.
+    [<Emit("$0.has($1)")>]
+    let mirrorStoreHas (store: obj) (o: obj) : bool =
+        jsNative
+
+    // Start tracking names that DynamicObj itself mirrored onto this object.
+    [<Emit("$0.set($1, new Set())")>]
+    let mirrorStoreCreate (store: obj) (o: obj) : unit =
+        jsNative
+
+    // Only names in this set may be removed from the runtime object later.
+    [<Emit("$0.has($1) && $0.get($1).has($2)")>]
+    let mirrorStoreHasProperty (store: obj) (o: obj) (propName: string) : bool =
+        jsNative
+
+    // Mark a runtime property as owned by DynamicObj's compatibility mirror.
+    [<Emit("$0.get($1).add($2)")>]
+    let mirrorStoreAddProperty (store: obj) (o: obj) (propName: string) : unit =
+        jsNative
+
+    // Unmark ownership after removing a DynamicObj-owned runtime mirror.
+    [<Emit("$0.has($1) && $0.get($1).delete($2)")>]
+    let mirrorStoreDeleteProperty (store: obj) (o: obj) (propName: string) : unit =
+        jsNative
+
+    let hasMirrorSet (o: obj) =
+        mirrorStoreHas (getMirrorSets ()) o
+
+    let createMirrorSet (o: obj) =
+        mirrorStoreCreate (getMirrorSets ()) o
+
+    let ensureMirrorSet (o: obj) =
+        if not (hasMirrorSet o) then
+            createMirrorSet o
+
+    let isMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreHasProperty (getMirrorSets ()) o propName
+
+    let markMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreAddProperty (getMirrorSets ()) o propName
+
+    let unmarkMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreDeleteProperty (getMirrorSets ()) o propName
+
+    [<Emit("$1 in $0")>]
+    let hasRuntimeProperty (o: obj) (propName: string) : bool =
+        jsNative
+
+    [<Emit("$0[$1] = $2")>]
+    let setRuntimeProperty (o: obj) (propName: string) (value: obj) : unit =
+        jsNative
+
+    [<Emit("delete $0[$1]")>]
+    let deleteRuntimeProperty (o: obj) (propName: string) : unit =
+        jsNative
+
+    // Mirror only new names, or names already owned by our mirror; never overwrite typed/runtime members.
+    let shouldMirrorDynamicProperty (o: obj) (propName: string) =
+        isMirroredProperty o propName || not (hasRuntimeProperty o propName)
+
+    // Keep native JS access like obj.extension working while Properties remains authoritative.
+    let mirrorDynamicProperty (o: obj) (propName: string) (value: obj) =
+        if shouldMirrorDynamicProperty o propName then
+            ensureMirrorSet o
+            setRuntimeProperty o propName value
+            markMirroredProperty o propName
+
+    // Remove only mirrors created by DynamicObj, leaving existing runtime members intact.
+    let removeDynamicPropertyMirror (o: obj) (propName: string) =
+        if isMirroredProperty o propName then
+            deleteRuntimeProperty o propName
+            unmarkMirroredProperty o propName
+
+    // Dynamic SetProperty writes to Properties first, then updates the optional native mirror.
+    let setPropertyValue (o:obj) (propName:string) (value:obj) =
+        setStoredPropertyValue o propName value
+        mirrorDynamicProperty o propName value
 
     let createSetter (propName:string) =
         fun (o:obj) (value:obj) -> 
          setPropertyValue o propName value
 
-    let removeStaticPropertyValue (o:obj) (propName:string) =
-        setPropertyValue o propName null
-
-    [<Emit("delete $0[$1]")>]
-    let deleteDynamicPropertyValue (o:obj) (propName:string) =
+    [<Emit("$0[$1] = $2")>]
+    let setStaticPropertyValue (o:obj) (propName:string) (value:obj) : unit =
         jsNative
+
+    let createStaticSetter (propName:string) =
+        fun (o:obj) (value:obj) ->
+         setStaticPropertyValue o propName value
+
+    let removeStaticPropertyValue (o:obj) (propName:string) =
+        setStaticPropertyValue o propName null
+
+    [<Emit("$0.Properties.delete($1)")>]
+    let deleteStoredPropertyValue (o:obj) (propName:string) : unit =
+        jsNative
+
+    let deleteDynamicPropertyValue (o:obj) (propName:string) =
+        deleteStoredPropertyValue o propName
+        removeDynamicPropertyMirror o propName
 
     let createRemover (propName:string) (isStatic : bool) =
         if isStatic then
@@ -78,13 +186,20 @@ module FableJS =
                 deleteDynamicPropertyValue o propName
 
 
-    [<Emit("$0[$1]")>]
     let getPropertyValue (o:obj) (propName:string) =
-        jsNative
+        getStoredPropertyValue o propName
 
     let createGetter (propName:string) =
         fun (o:obj) -> 
             getPropertyValue o propName
+
+    [<Emit("$0[$1]")>]
+    let getStaticPropertyValue (o:obj) (propName:string) : obj =
+        jsNative
+
+    let createStaticGetter (propName:string) =
+        fun (o:obj) ->
+            getStaticPropertyValue o propName
 
     [<Emit("Object.getOwnPropertyDescriptor($0, $1)")>]
     let tryGetPropertyDescriptor (o:obj) (propName:string) : obj option =
@@ -104,8 +219,8 @@ module FableJS =
                 IsDynamic = false
                 IsMutable = isWritable
                 IsImmutable = not isWritable
-                GetValue = createGetter name
-                SetValue = createSetter name
+                GetValue = createStaticGetter name
+                SetValue = createStaticSetter name
                 RemoveValue = createRemover name true
             }     
             |> Some
@@ -118,37 +233,42 @@ module FableJS =
         getStaticPropertyNames o
         |> Array.choose (tryGetStaticPropertyHelper o)
 
-    let tryGetDynamicPropertyDescriptor (o:obj) (propName:string) : obj option =
-        tryGetPropertyDescriptor o propName
-
-    let transpiledPropertyRegex = "^[a-zA-Z]+@[0-9]+$"
-
-    let isTranspiledPropertyHelper (propertyName : string) =
-        System.Text.RegularExpressions.Regex.IsMatch(propertyName, transpiledPropertyRegex)
-
-    let tryDynamicPropertyHelperFromDescriptor (pd:obj) (name:string) : PropertyHelper option =
-        if PropertyDescriptor.isFunction pd || isTranspiledPropertyHelper name then 
-                None
-        else 
+    let tryGetDynamicPropertyHelper (o:obj) (propName:string) : PropertyHelper option =
+        if hasStoredPropertyValue o propName then
             {
-                Name = name
+                Name = propName
                 IsStatic = false
                 IsDynamic = true
                 IsMutable = true
                 IsImmutable = false
-                GetValue = createGetter name
-                SetValue = createSetter name
-                RemoveValue = createRemover name false
-            }     
+                GetValue = createGetter propName
+                SetValue = createSetter propName
+                RemoveValue = createRemover propName false
+            }
             |> Some
-
-    let tryGetDynamicPropertyHelper (o:obj) (propName:string) : PropertyHelper option =
-        tryGetDynamicPropertyDescriptor o propName
-        |> Option.bind (fun pd -> tryDynamicPropertyHelperFromDescriptor pd propName)
+        else
+            None
 
     let getDynamicPropertyHelpers (o:obj) : PropertyHelper [] =
-        getOwnPropertyNames o
-        |> Array.choose (tryGetDynamicPropertyHelper o)
+        getDynamicPropertyObjects o
+        |> Seq.map (fun kv ->
+            {
+                Name = kv.Key
+                IsStatic = false
+                IsDynamic = true
+                IsMutable = true
+                IsImmutable = false
+                GetValue = createGetter kv.Key
+                SetValue = createSetter kv.Key
+                RemoveValue = createRemover kv.Key false
+            }
+        )
+        |> Seq.toArray
+
+    // Used by ofDict because assigning Properties directly bypasses SetProperty mirroring.
+    let syncRuntimeDynamicProperties (o: obj) =
+        getDynamicPropertyObjects o
+        |> Seq.iter (fun kv -> mirrorDynamicProperty o kv.Key kv.Value)
 
     let getPropertyHelpers (o:obj) =
         getDynamicPropertyHelpers o

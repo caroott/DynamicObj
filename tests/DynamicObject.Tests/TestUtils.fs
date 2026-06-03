@@ -25,6 +25,41 @@ type DerivedClassWithMutableInstanceProperty(?location: string) =
         and set(value) = _location <- value
 
 [<AttachMembers>]
+type DerivedClassWithMutableStringInstanceProperty(location: string) =
+    inherit DynamicObj()
+    let mutable _location = location
+    member this.Location
+        with get() = _location
+        and set(value) = _location <- value
+
+module NativeRuntime =
+
+    #if FABLE_COMPILER_PYTHON
+    [<Emit("hasattr($0, $1)")>]
+    let hasProperty (o: obj) (propertyName: string) : bool =
+        nativeOnly
+
+    [<Emit("getattr($0, $1)")>]
+    let getProperty (o: obj) (propertyName: string) : obj =
+        nativeOnly
+    #endif
+
+    #if FABLE_COMPILER_JAVASCRIPT || FABLE_COMPILER_TYPESCRIPT
+    [<Emit("$1 in $0")>]
+    let hasProperty (o: obj) (propertyName: string) : bool =
+        jsNative
+
+    [<Emit("$0[$1]")>]
+    let getProperty (o: obj) (propertyName: string) : obj =
+        jsNative
+    #endif
+
+    #if !FABLE_COMPILER
+    let hasProperty (_: obj) (_: string) : bool = false
+    let getProperty (_: obj) (_: string) : obj = null
+    #endif
+
+[<AttachMembers>]
 type DerivedClassCloneable(stat: string, dyn: string) as this =
     inherit DynamicObj()
     do

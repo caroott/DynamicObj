@@ -101,14 +101,104 @@ module FablePy =
     let getPropertyValue (o:obj) (propName:string) =
         nativeOnly
 
+    // Track DynamicObj-owned runtime mirrors outside the object so user keys cannot collide.
+    // Use id-based storage because DynamicObj has structural equality/hash in Python.
+    // The value is an id(obj) -> set(propertyName) map of names mirrored by DynamicObj.
+    [<Emit("""globals().setdefault("_dynamicObjMirrorSets", {})""")>]
+    let getMirrorSets () : obj =
+        nativeOnly
+
+    // Keep cleanup callbacks alive until the mirrored object is collected.
+    [<Emit("""globals().setdefault("_dynamicObjMirrorFinalizers", {})""")>]
+    let getMirrorFinalizers () : obj =
+        nativeOnly
+
+    // Check whether this object already has mirror ownership metadata.
+    [<Emit("""id($1) in $0""")>]
+    let mirrorStoreHas (store: obj) (o: obj) : bool =
+        nativeOnly
+
+    // Create ownership metadata and register cleanup for the id-based mirror entry.
+    [<Emit("""($0.setdefault(id($2), __import__("weakref").finalize($2, lambda oid=id($2): ($1.pop(oid, None), $0.pop(oid, None)))), $1.setdefault(id($2), set()))""")>]
+    let mirrorStoreCreate (finalizers: obj) (store: obj) (o: obj) : unit =
+        nativeOnly
+
+    // Only names in this set may be removed from the runtime object later.
+    [<Emit("""id($1) in $0 and $2 in $0[id($1)]""")>]
+    let mirrorStoreHasProperty (store: obj) (o: obj) (propName: string) : bool =
+        nativeOnly
+
+    // Mark a runtime attribute as owned by DynamicObj's compatibility mirror.
+    [<Emit("""$0[id($1)].add($2)""")>]
+    let mirrorStoreAddProperty (store: obj) (o: obj) (propName: string) : unit =
+        nativeOnly
+
+    // Unmark ownership after removing a DynamicObj-owned runtime mirror.
+    [<Emit("""id($1) in $0 and $0[id($1)].discard($2)""")>]
+    let mirrorStoreDeleteProperty (store: obj) (o: obj) (propName: string) : unit =
+        nativeOnly
+
+    let hasMirrorSet (o: obj) =
+        mirrorStoreHas (getMirrorSets ()) o
+
+    let createMirrorSet (o: obj) =
+        mirrorStoreCreate (getMirrorFinalizers ()) (getMirrorSets ()) o
+
+    let ensureMirrorSet (o: obj) =
+        if not (hasMirrorSet o) then
+            createMirrorSet o
+
+    let isMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreHasProperty (getMirrorSets ()) o propName
+
+    let markMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreAddProperty (getMirrorSets ()) o propName
+
+    let unmarkMirroredProperty (o: obj) (propName: string) =
+        mirrorStoreDeleteProperty (getMirrorSets ()) o propName
+
+    [<Emit("hasattr($0, $1)")>]
+    let hasRuntimeProperty (o: obj) (propName: string) : bool =
+        nativeOnly
+
+    [<Emit("setattr($0, $1, $2)")>]
+    let setRuntimeProperty (o: obj) (propName: string) (value: obj) : unit =
+        nativeOnly
+
+    [<Emit("delattr($0, $1)")>]
+    let deleteRuntimeProperty (o: obj) (propName: string) : unit =
+        nativeOnly
+
+    // Mirror only new names, or names already owned by our mirror; never overwrite typed/runtime members.
+    let shouldMirrorDynamicProperty (o: obj) (propName: string) =
+        isMirroredProperty o propName || not (hasRuntimeProperty o propName)
+
+    // Keep native Python access like obj.extension working while Properties remains authoritative.
+    let mirrorDynamicProperty (o: obj) (propName: string) (value: obj) =
+        if shouldMirrorDynamicProperty o propName then
+            ensureMirrorSet o
+            setRuntimeProperty o propName value
+            markMirroredProperty o propName
+
+    // Remove only mirrors created by DynamicObj, leaving existing runtime members intact.
+    let removeDynamicPropertyMirror (o: obj) (propName: string) =
+        if isMirroredProperty o propName then
+            deleteRuntimeProperty o propName
+            unmarkMirroredProperty o propName
+
     let createGetter (propName:string) =
         fun (o:obj) ->
             getPropertyValue o propName
 
     // Keep SetProperty aligned with .NET by writing dynamic values to Properties.
     [<Emit("$0.Properties[$1] = $2")>]
-    let setPropertyValue (o:obj) (propName:string) (value:obj) : unit =
+    let setStoredPropertyValue (o:obj) (propName:string) (value:obj) : unit =
         nativeOnly
+
+    // Dynamic SetProperty writes to Properties first, then updates the optional native mirror.
+    let setPropertyValue (o:obj) (propName:string) (value:obj) : unit =
+        setStoredPropertyValue o propName value
+        mirrorDynamicProperty o propName value
 
     let createSetter (propName:string) =
         fun (o:obj) (value:obj) ->
@@ -142,8 +232,12 @@ module FablePy =
         setStaticPropertyValue o propName null
 
     [<Emit("$0.Properties.pop($1, None)")>]
-    let deleteDynamicPropertyValue (o:obj) (propName:string) =
+    let deleteStoredPropertyValue (o:obj) (propName:string) : unit =
         nativeOnly
+
+    let deleteDynamicPropertyValue (o:obj) (propName:string) =
+        deleteStoredPropertyValue o propName
+        removeDynamicPropertyMirror o propName
 
     let createRemover (propName:string) (isStatic : bool) =
         if isStatic then
@@ -257,6 +351,11 @@ module FablePy =
     let getPropertyNames (o:obj) =
         getPropertyHelpers o 
         |> Array.map (fun h -> h.Name)
+
+    // Used by ofDict because assigning Properties directly bypasses SetProperty mirroring.
+    let syncRuntimeDynamicProperties (o: obj) =
+        getDynamicMemberObjects o
+        |> Seq.iter (fun kv -> mirrorDynamicProperty o kv.Key kv.Value)
 
     module Interfaces = 
         
